@@ -1,23 +1,14 @@
-﻿//
-// DFGate.m — 卡密门禁 dylib（配合自建 keyserver 使用）
 //
-// 作用：注入后，App 启动时先校验卡密（本地缓存 + 服务器激活），
-//       未通过则直接终止启动流程（返回 NO），通过才放行。
+// DFGate.m — 卡密门禁 dylib（v2：不阻塞启动，改用模态框拦截）
 //
-// 编译（二选一）：
-//   A. Theos（推荐）
-//        $THEOS/makefiles/... 见同目录 Makefile：`make package` 得到 .deb，
-//        或 `make` 得到 .obj/DFGate.dylib
-//   B. 直接用 Xcode 的 clang（有 macOS + iOS SDK 时）
-//        clang -arch arm64 -miphoneos-version-min=15.0 -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
-//              -dynamiclib -framework Foundation -framework UIKit -o DFGate.dylib DFGate.m
+// v1 的问题：在 application:didFinishLaunching 里用信号量等主线程弹窗 → 死锁 → 白屏 → 被系统杀
+// v2 的做法：
+//   1. 让 App 正常启动（返回原始返回值）
+//   2. 启动后异步校验：本地有卡密就请求服务器
+//   3. 校验不通过 → 弹一个只有「激活/退出」的模态框，盖住界面；不激活就用不了
+//   4. 点退出 = exit(0)
 //
-// 注入（任选，均需重签）：
-//   1) 静态：用 insert_dylib / optool 给可执行文件加 LC_LOAD_DYLIB
-//      指向 @executable_path/DFGate.dylib，放进 App 根目录，然后 ldid -S 重签
-//   2) 越狱：装成 tweak，由 Cydia/Sileo 加载
-//
-// 配置：改下面 kServerBase / kKeyId / kPrefKey 三个常量即可
+// 编译/注入见同目录 README
 //
 
 #import <Foundation/Foundation.h>
@@ -25,24 +16,21 @@
 #import <objc/runtime.h>
 
 // ======================= 配置区 =======================
-static NSString *const kServerBase = @"http://192.168.1.125:8787";   // 你的 keyserver 地址
-static NSString *const kPrefKey    = @"DFUA_license";              // 本地缓存键
-static NSString *const kPrefMeta   = @"DFUA_license_meta";         // 到期信息缓存
-static const  BOOL      kStrict    = YES;                          // YES=服务器不通就不放行
-static const  double    kTimeout   = 8.0;                          // 激活请求超时（秒）
+static NSString *const kServerBase = @"http://192.168.1.125:8787";
+static NSString *const kPrefKey    = @"DFUA_license";
+static const  BOOL      kStrict    = YES;    // YES=服务器不通也不放行
+static const  double    kTimeout   = 8.0;
+static NSString *const kAppDelegateClass = @"k52msrp07bj14wt63uqhd9nlf8cxyaz5";
 // =====================================================
 
-static BOOL     gVerified = NO;
-static NSString *gReason  = nil;
+static UIAlertController *gAlert = nil;
+static BOOL gBusy = NO;
 
 static NSString *deviceId(void) {
-    // 优先 identifierForVendor（不需要额外权限）
     NSUUID *u = [[UIDevice currentDevice] identifierForVendor];
-    if (u) return [u UUIDString];
-    return @"unknown-device";
+    return u ? [u UUIDString] : @"unknown-device";
 }
 
-// 同步 POST（用信号量把异步转同步，最多等 kTimeout 秒）
 static NSDictionary *postSync(NSString *path, NSDictionary *body) {
     NSURL *url = [NSURL URLWithString:[kServerBase stringByAppendingString:path]];
     if (!url) return nil;
@@ -54,106 +42,128 @@ static NSDictionary *postSync(NSString *path, NSDictionary *body) {
 
     __block NSDictionary *result = nil;
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-    NSURLSessionDataTask *t =
-    [[NSURLSession sharedSession] dataTaskWithRequest:req
-                                   completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
-        if (data.length) {
-            id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-            if ([obj isKindOfClass:[NSDictionary class]]) result = obj;
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req
+                                   completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+        if (d.length) {
+            id o = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+            if ([o isKindOfClass:[NSDictionary class]]) result = o;
         }
         dispatch_semaphore_signal(sem);
-    }];
-    [t resume];
+    }] resume];
     dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kTimeout * NSEC_PER_SEC)));
     return result;
 }
 
-// 校验流程：先本地缓存 → 再服务器激活/校验
-static void runVerify(void) {
-    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    NSString *key = [d stringForKey:kPrefKey];
-    if (key.length == 0) { gReason = @"未激活"; return; }
-
-    NSDictionary *r = postSync(@"/activate", @{ @"key": key,
-                                                @"device": deviceId(),
-                                                @"ver": @"1.0" });
-    if (!r) {
-        // 服务器不可达
-        if (kStrict) { gReason = @"无法连接验证服务器"; return; }
-        gVerified = YES;   // 宽松模式：放行，只记录
-        return;
+static UIViewController *topVC(void) {
+    UIWindow *w = UIApplication.sharedApplication.keyWindow;
+    if (!w) {
+        for (UIWindow *x in UIApplication.sharedApplication.windows) { w = x; break; }
     }
-    if ([r[@"ok"] boolValue]) {
-        gVerified = YES;
-        [d setObject:r forKey:kPrefMeta];
-        return;
-    }
-    gReason = r[@"code"] ?: (r[@"err"] ?: @"验证失败");
-    // 被停用/过期 → 清本地卡密，强制重新输入
-    NSString *code = r[@"code"];
-    if ([code isEqualToString:@"REVOKED"] || [code isEqualToString:@"EXPIRED"] ||
-        [code isEqualToString:@"DEVICE_MISMATCH"]) {
-        [d removeObjectForKey:kPrefKey];
-    }
-    [d synchronize];
+    UIViewController *vc = w.rootViewController;
+    while (vc.presentedViewController) vc = vc.presentedViewController;
+    return vc;
 }
 
-// 简单的输入框（在主线程调用）
-static void promptKey(dispatch_block_t done) {
+static void verifyAsync(void (^done)(BOOL ok, NSString *why)) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+        NSString *key = [d stringForKey:kPrefKey];
+        if (key.length == 0) {
+            dispatch_async(dispatch_get_main_queue(), ^{ done(NO, @"未激活，请输入卡密"); });
+            return;
+        }
+        NSDictionary *r = postSync(@"/activate", @{ @"key": key,
+                                                    @"device": deviceId(),
+                                                    @"ver": @"2.0" });
+        BOOL ok = (r && [r[@"ok"] boolValue]);
+        NSString *why = nil;
+        if (!r) why = @"无法连接验证服务器";
+        else if (!ok) why = r[@"code"] ?: (r[@"err"] ?: @"验证失败");
+        NSString *code = r[@"code"];
+        if ([code isEqualToString:@"REVOKED"] || [code isEqualToString:@"EXPIRED"] ||
+            [code isEqualToString:@"DEVICE_MISMATCH"]) {
+            [d removeObjectForKey:kPrefKey];
+            [d synchronize];
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{ done(ok, why); });
+    });
+}
+
+// 弹出拦截框（只允许「激活」或「退出」）
+static void showGate(NSString *why) {
+    if (gAlert || gBusy) return;
+    UIViewController *vc = topVC();
+    if (!vc) {
+        // 界面还没起来，稍后重试
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ showGate(why); });
+        return;
+    }
+
     UIAlertController *a = [UIAlertController alertControllerWithTitle:@"卡密验证"
-                                                              message:@"请输入卡密（DFUA-XXXX-XXXX-XXXX-XXXX）"
+                                                              message:why ?: @"请输入卡密"
                                                        preferredStyle:UIAlertControllerStyleAlert];
     [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
         tf.placeholder = @"DFUA-XXXX-XXXX-XXXX-XXXX";
         tf.autocapitalizationType = UITextAutocapitalizationTypeAllCharacters;
         tf.autocorrectionType = UITextAutocorrectionTypeNo;
     }];
+    __weak UIAlertController *weakA = a;
     [a addAction:[UIAlertAction actionWithTitle:@"激活" style:UIAlertActionStyleDefault
                                        handler:^(UIAlertAction *act) {
-        NSString *k = [a.textFields.firstObject.text stringByTrimmingCharactersInSet:
+        NSString *k = [weakA.textFields.firstObject.text stringByTrimmingCharactersInSet:
                        [NSCharacterSet whitespaceAndNewlineCharacterSet]].uppercaseString;
-        if (k.length) [[NSUserDefaults standardUserDefaults] setObject:k forKey:kPrefKey];
-        [[NSUserDefaults standardUserDefaults] synchronize];
-        runVerify();
-        if (done) done();
+        if (k.length) {
+            [[NSUserDefaults standardUserDefaults] setObject:k forKey:kPrefKey];
+            [[NSUserDefaults standardUserDefaults] synchronize];
+        }
+        gBusy = YES;
+        verifyAsync(^(BOOL ok, NSString *w) {
+            gBusy = NO;
+            if (ok) {
+                NSLog(@"[DFGate] 验证通过");
+                gAlert = nil;
+                return;
+            }
+            NSLog(@"[DFGate] 验证失败: %@", w);
+            gAlert = nil;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ showGate(w); });
+        });
     }]];
-    [a addAction:[UIAlertAction actionWithTitle:@"退出" style:UIAlertActionStyleCancel
-                                       handler:^(UIAlertAction *act) { if (done) done(); }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"退出" style:UIAlertActionStyleDestructive
+                                       handler:^(UIAlertAction *act) {
+        NSLog(@"[DFGate] 用户退出");
+        exit(0);
+    }]];
+    // 禁止点击遮罩关闭
+    a.modalInPopover = YES;
 
-    UIWindow *win = UIApplication.sharedApplication.keyWindow;
-    UIViewController *top = win.rootViewController;
-    while (top.presentedViewController) top = top.presentedViewController;
-    [top presentViewController:a animated:YES completion:nil];
+    gAlert = a;
+    [vc presentViewController:a animated:YES completion:nil];
+    NSLog(@"[DFGate] 已弹出卡密拦截框: %@", why);
 }
 
-// ============== 拦截主 App 的启动方法 ==============
-// AppDelegate 类名是混淆的，这里按名字取；换成你自己的类名亦可
-static NSString *const kAppDelegateClass = @"k52msrp07bj14wt63uqhd9nlf8cxyaz5";
-
+// ============ 挂钩：启动后异步校验，不阻塞 ============
 static IMP gOrigLaunch = NULL;
 
 static BOOL my_didFinishLaunching(id self, SEL _cmd, UIApplication *app, NSDictionary *opts) {
-    runVerify();
-    if (!gVerified) {
-        // 未通过：弹框让用户输入，输完再决定
-        __block BOOL allow = NO;
-        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-        dispatch_async(dispatch_get_main_queue(), ^{
-            promptKey(^{
-                allow = gVerified;
-                dispatch_semaphore_signal(sem);
-            });
-        });
-        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(120 * NSEC_PER_SEC)));
-        if (!allow) {
-            NSLog(@"[DFGate] 拦截启动，原因: %@", gReason);
-            return NO;      // 直接终止启动
-        }
-    }
+    BOOL ret = YES;
     if (gOrigLaunch) {
-        return ((BOOL (*)(id, SEL, UIApplication *, NSDictionary *))gOrigLaunch)(self, _cmd, app, opts);
+        ret = ((BOOL (*)(id, SEL, UIApplication *, NSDictionary *))gOrigLaunch)(self, _cmd, app, opts);
     }
-    return YES;
+    // 界面起来后再校验
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        verifyAsync(^(BOOL ok, NSString *why) {
+            if (ok) {
+                NSLog(@"[DFGate] 缓存卡密有效，放行");
+            } else {
+                showGate(why);
+            }
+        });
+    });
+    return ret;
 }
 
 __attribute__((constructor))
@@ -161,18 +171,17 @@ static void dfgate_init(void) {
     @autoreleasepool {
         Class cls = NSClassFromString(kAppDelegateClass);
         if (!cls) {
-            // 退化：只做校验，不拦启动（便于调试）
-            runVerify();
-            NSLog(@"[DFGate] 类未找到，仅校验: %@", gVerified ? @"通过" : gReason);
+            NSLog(@"[DFGate] 未找到 AppDelegate 类，门禁未生效");
             return;
         }
         SEL sel = sel_registerName("application:didFinishLaunchingWithOptions:");
         Method m = class_getInstanceMethod(cls, sel);
-        if (m) {
-            gOrigLaunch = method_getImplementation(m);
-            method_setImplementation(m, (IMP)my_didFinishLaunching);
-            NSLog(@"[DFGate] 已挂钩启动流程");
+        if (!m) {
+            NSLog(@"[DFGate] 未找到启动方法，门禁未生效");
+            return;
         }
+        gOrigLaunch = method_getImplementation(m);
+        method_setImplementation(m, (IMP)my_didFinishLaunching);
+        NSLog(@"[DFGate] 门禁已挂钩");
     }
 }
-
