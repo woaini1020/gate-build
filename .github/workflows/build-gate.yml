@@ -1,4 +1,4 @@
-name: Build Gate IPA
+name: Build Gate (Linux cross-compile)
 
 on:
   workflow_dispatch:
@@ -9,30 +9,66 @@ defaults:
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
-      - name: Show Xcode
+      - name: Install toolchain
         run: |
-          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer || true
-          xcrun --sdk iphoneos --show-sdk-path
+          sudo apt-get update
+          sudo apt-get install -y clang lld llvm make git curl xz-utils unzip libplist-dev libssl-dev cmake
+          clang --version
+          ls /usr/bin | grep -i lld || true
 
-      - name: Install ldid
-        run: brew install ldid || echo "ldid failed, fallback to codesign"
-
-      - name: Build dylib
+      - name: Fetch iOS SDK
         run: |
-          make
+          set -e
+          cd $HOME
+          git clone --filter=blob:none --no-checkout --depth 1 https://github.com/theos/sdks.git sdk-repo
+          cd sdk-repo
+          git sparse-checkout init --cone
+          git sparse-checkout set iPhoneOS16.5.sdk
+          git checkout
+          du -sh iPhoneOS16.5.sdk
+          ls iPhoneOS16.5.sdk | head -20
+
+      - name: Build dylib (arm64 iOS)
+        run: |
+          set -e
+          SDK=$HOME/sdk-repo/iPhoneOS16.5.sdk
+          clang -target arm64-apple-ios15.0 -isysroot "$SDK" \
+                -dynamiclib -fobjc-arc -O2 -Wall -Wno-unused-parameter \
+                -framework Foundation -framework UIKit \
+                -fuse-ld=lld \
+                -Wl,-platform_version,ios,15.0,18.2 \
+                -Wl,-install_name,@executable_path/DFGate.dylib \
+                -o DFGate.dylib DFGate.m
           ls -lh DFGate.dylib
           file DFGate.dylib
+          python3 - <<'PY'
+          import struct
+          b = open("DFGate.dylib","rb").read()
+          assert b[:4] == b"\xcf\xfa\xed\xfe", "not a thin arm64 mach-o: %s" % b[:4].hex()
+          n = struct.unpack("<I", b[16:20])[0]
+          p, ids = 32, []
+          for _ in range(n):
+              c, s = struct.unpack("<II", b[p:p+8])
+              if c == 0xD:   # LC_ID_DYLIB
+                  no = struct.unpack("<I", b[p+8:p+12])[0]
+                  ids.append(b[p+no:p+s].split(b"\x00")[0].decode())
+              p += s
+          print("LC_ID_DYLIB:", ids)
+          assert ids, "missing LC_ID_DYLIB"
+          print("DYLIB OK")
+          PY
 
       - name: Inject into IPA
         run: |
+          set -e
           python3 inject_lc.py --ipa base.tipa --dylib DFGate.dylib --out gated.tipa
           ls -lh gated.tipa
 
-      - name: Verify
+      - name: Verify package
         run: |
           python3 - <<'PY'
           import zipfile, struct
@@ -41,6 +77,7 @@ jobs:
           assert any(n.endswith("DFGate.dylib") for n in names), "dylib not packed"
           exe = [n for n in names if n.startswith("Payload/") and n.count("/") == 2
                  and not n.endswith("/") and "." not in n.rsplit("/", 1)[-1]]
+          assert exe, "exe not found"
           b = z.read(exe[0])
           n = struct.unpack("<I", b[16:20])[0]
           p, found = 32, None
