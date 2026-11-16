@@ -1,0 +1,59 @@
+name: Build Gate IPA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer || true
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Install ldid
+        run: brew install ldid || echo "ldid failed, fallback to codesign"
+
+      - name: Build dylib
+        run: |
+          make
+          ls -lh DFGate.dylib
+          file DFGate.dylib
+
+      - name: Inject into IPA
+        run: |
+          python3 inject_lc.py --ipa base.tipa --dylib DFGate.dylib --out gated.tipa
+          ls -lh gated.tipa
+
+      - name: Verify
+        run: |
+          python3 - <<'PY'
+          import zipfile, struct
+          z = zipfile.ZipFile("gated.tipa")
+          names = z.namelist()
+          assert any(n.endswith("DFGate.dylib") for n in names), "dylib not packed"
+          exe = [n for n in names if n.startswith("Payload/") and n.count("/") == 2
+                 and not n.endswith("/") and "." not in n.rsplit("/", 1)[-1]]
+          b = z.read(exe[0])
+          n = struct.unpack("<I", b[16:20])[0]
+          p, found = 32, None
+          for _ in range(n):
+              c, s = struct.unpack("<II", b[p:p+8])
+              if c in (0xC, 0x80000018):
+                  no = struct.unpack("<I", b[p+8:p+12])[0]
+                  found = b[p+no:p+s].split(b"\x00")[0].decode()
+              p += s
+          print("exe:", exe[0])
+          print("LC:", found)
+          assert found and "DFGate.dylib" in found
+          print("VERIFY OK")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gated-ipa
+          path: gated.tipa
+          retention-days: 7
