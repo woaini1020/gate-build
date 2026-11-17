@@ -1,38 +1,97 @@
 //
-// DFGate.m — 卡密门禁 dylib（v2：不阻塞启动，改用模态框拦截）
+// DFGate.m — 卡密门禁 dylib（v4：响应验签 + 防重放 + 地址混淆 + 入口拦截）
 //
-// v1 的问题：在 application:didFinishLaunching 里用信号量等主线程弹窗 → 死锁 → 白屏 → 被系统杀
-// v2 的做法：
-//   1. 让 App 正常启动（返回原始返回值）
-//   2. 启动后异步校验：本地有卡密就请求服务器
-//   3. 校验不通过 → 弹一个只有「激活/退出」的模态框，盖住界面；不激活就用不了
-//   4. 点退出 = exit(0)
+// 相对 v3 加固点：
+//   1. 服务器地址、签名密钥都做异或混淆，strings 看不到明文
+//   2. 请求带 nonce + ts（服务端校验 5 分钟窗口并去重，防重放）
+//   3. 响应必须带 HMAC-SHA256 签名，客户端验签通过才放行
+//      → 自己搭假服务器返回 {"ok":true} 也没用，除非逆出内嵌密钥
+//   4. 本地缓存带签名，改 NSUserDefaults 伪造 expires 无效
+//   5. 时间回拨检测：当前时间早于上次服务器时间则拒绝
+//   6. 入口方法拦截（mainButtonTapped: / doInitKernel / doStartHUD / initKernelWithCompletion:）
 //
-// 编译/注入见同目录 README
+// 注意：kUrlEnc / kSigEnc 与服务器 keyserver.py 的 DF_SIGN_SECRET 必须对应
 //
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#import <CommonCrypto/CommonHMAC.h>
+#import <CommonCrypto/CommonDigest.h>
 #import <objc/runtime.h>
+#import <stdlib.h>
 
-// ======================= 配置区 =======================
-static NSString *const kServerBase = @"http://192.168.1.125:8787";
-static NSString *const kPrefKey    = @"DFUA_license";
-static const  BOOL      kStrict    = YES;    // YES=服务器不通也不放行
-static const  double    kTimeout   = 8.0;
+// ======================= 混淆常量（0x5A 异或）=======================
+// http://192.168.1.125:8787
+static const unsigned char kUrlEnc[] = {
+    0x32, 0x2E, 0x2E, 0x2A, 0x60, 0x75, 0x75, 0x6B, 0x63, 0x68, 0x74, 0x6B, 0x6C,
+    0x62, 0x74, 0x6B, 0x74, 0x6B, 0x68, 0x6F, 0x60, 0x62, 0x6D, 0x62, 0x6D
+};
+// df-gate-sign-please-change-32bytes
+static const unsigned char kSigEnc[] = {
+    0x3E, 0x3C, 0x77, 0x3D, 0x3B, 0x2E, 0x3F, 0x77, 0x29, 0x33, 0x3D, 0x34, 0x77,
+    0x2A, 0x36, 0x3F, 0x3B, 0x29, 0x3F, 0x77, 0x39, 0x32, 0x3B, 0x34, 0x3D, 0x3F,
+    0x77, 0x69, 0x68, 0x38, 0x23, 0x2E, 0x3F, 0x29
+};
+// ================================================================
+
+static NSString *const kPrefKey   = @"DFUA_license";
+static NSString *const kPrefTicket= @"DFUA_ticket";
+static NSString *const kPrefLastTs= @"DFUA_last_ts";
+static const  BOOL      kStrict   = YES;
+static const  double    kTimeout  = 8.0;
 static NSString *const kAppDelegateClass = @"k52msrp07bj14wt63uqhd9nlf8cxyaz5";
-// =====================================================
+static NSString *const kGateVCClass      = @"b2lrzw37gk19vs26jmcp8dqh4nuxey6";
 
+static volatile BOOL gVerified = NO;
 static UIAlertController *gAlert = nil;
-static BOOL gBusy = NO;
 
-static NSString *deviceId(void) {
-    NSUUID *u = [[UIDevice currentDevice] identifierForVendor];
-    return u ? [u UUIDString] : @"unknown-device";
+// ---------------- 工具 ----------------
+static NSString *decode(const unsigned char *p, size_t n) {
+    char buf[256] = {0};
+    for (size_t i = 0; i < n && i < sizeof(buf) - 1; i++) buf[i] = (char)(p[i] ^ 0x5A);
+    return [NSString stringWithUTF8String:buf];
+}
+static NSString *serverBase(void) { return decode(kUrlEnc, sizeof(kUrlEnc)); }
+static NSString *signSecret(void) { return decode(kSigEnc, sizeof(kSigEnc)); }
+
+static NSString *hexOf(NSData *d) {
+    const unsigned char *b = d.bytes;
+    NSMutableString *s = [NSMutableString stringWithCapacity:d.length * 2];
+    for (NSUInteger i = 0; i < d.length; i++) [s appendFormat:@"%02x", b[i]];
+    return s;
 }
 
+static NSString *sha256Hex(NSString *s) {
+    NSData *in = [s dataUsingEncoding:NSUTF8StringEncoding];
+    unsigned char out[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(in.bytes, (CC_LONG)in.length, out);
+    return hexOf([NSData dataWithBytes:out length:sizeof(out)]);
+}
+
+static NSString *hmacHex(NSString *msg) {
+    NSData *k = [signSecret() dataUsingEncoding:NSUTF8StringEncoding];
+    NSData *m = [msg dataUsingEncoding:NSUTF8StringEncoding];
+    unsigned char out[CC_SHA256_DIGEST_LENGTH];
+    CCHmac(kCCHmacAlgSHA256, k.bytes, k.length, m.bytes, m.length, out);
+    return hexOf([NSData dataWithBytes:out length:sizeof(out)]);
+}
+
+// 设备指纹：idfv + 机型，再哈希（不直接暴露原始 idfv）
+static NSString *deviceId(void) {
+    NSString *idfv = [[[UIDevice currentDevice] identifierForVendor] UUIDString] ?: @"none";
+    NSString *raw = [NSString stringWithFormat:@"%@|%@", idfv, [[UIDevice currentDevice] model]];
+    return [sha256Hex(raw) substringToIndex:32];
+}
+
+static NSString *randomNonce(void) {
+    unsigned char buf[16];
+    arc4random_buf(buf, sizeof(buf));
+    return [hexOf([NSData dataWithBytes:buf length:sizeof(buf)]) substringToIndex:24];
+}
+
+// ---------------- 网络 ----------------
 static NSDictionary *postSync(NSString *path, NSDictionary *body) {
-    NSURL *url = [NSURL URLWithString:[kServerBase stringByAppendingString:path]];
+    NSURL *url = [NSURL URLWithString:[serverBase() stringByAppendingString:path]];
     if (!url) return nil;
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
     req.HTTPMethod = @"POST";
@@ -54,14 +113,30 @@ static NSDictionary *postSync(NSString *path, NSDictionary *body) {
     return result;
 }
 
-static UIViewController *topVC(void) {
-    UIWindow *w = UIApplication.sharedApplication.keyWindow;
-    if (!w) {
-        for (UIWindow *x in UIApplication.sharedApplication.windows) { w = x; break; }
-    }
-    UIViewController *vc = w.rootViewController;
-    while (vc.presentedViewController) vc = vc.presentedViewController;
-    return vc;
+static NSString *humanize(NSString *code, NSString *fb) {
+    if ([code isEqualToString:@"NOT_FOUND"])       return @"卡密不存在，请核对";
+    if ([code isEqualToString:@"REVOKED"])         return @"该卡密已被停用";
+    if ([code isEqualToString:@"EXPIRED"])         return @"该卡密已过期";
+    if ([code isEqualToString:@"DEVICE_MISMATCH"]) return @"该卡密已绑定其他设备";
+    if ([code isEqualToString:@"MISSING_KEY"])     return @"请输入卡密";
+    if ([code isEqualToString:@"STALE"])           return @"设备时间异常，请校准时间";
+    if ([code isEqualToString:@"REPLAY"])          return @"请求重复，请重试";
+    if ([code isEqualToString:@"BAD_SIGNATURE"])   return @"响应校验失败";
+    return fb.length ? fb : @"验证失败";
+}
+
+// 校验响应签名：payload = ok|expires|ts|nonce|device
+static BOOL verifyResponse(NSDictionary *r, NSString *device) {
+    if (![r isKindOfClass:[NSDictionary class]]) return NO;
+    NSString *sig = r[@"sig"];
+    if (![sig isKindOfClass:[NSString class]] || sig.length != 64) return NO;
+    NSString *msg = [NSString stringWithFormat:@"%@|%lld|%lld|%@|%@",
+                     ([r[@"ok"] boolValue] ? @"1" : @"0"),
+                     (long long)[r[@"expires"] longLongValue],
+                     (long long)[r[@"ts"] longLongValue],
+                     r[@"nonce"] ?: @"",
+                     device];
+    return [sig isEqualToString:hmacHex(msg)];
 }
 
 static void verifyAsync(void (^done)(BOOL ok, NSString *why)) {
@@ -69,39 +144,72 @@ static void verifyAsync(void (^done)(BOOL ok, NSString *why)) {
         NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
         NSString *key = [d stringForKey:kPrefKey];
         if (key.length == 0) {
-            dispatch_async(dispatch_get_main_queue(), ^{ done(NO, @"未激活，请输入卡密"); });
+            done(NO, @"请输入卡密后激活");   // 已在后台队列，直接回调
             return;
         }
-        NSDictionary *r = postSync(@"/activate", @{ @"key": key,
-                                                    @"device": deviceId(),
-                                                    @"ver": @"2.0" });
-        BOOL ok = (r && [r[@"ok"] boolValue]);
-        NSString *why = nil;
-        if (!r) why = @"无法连接验证服务器";
-        else if (!ok) why = r[@"code"] ?: (r[@"err"] ?: @"验证失败");
-        NSString *code = r[@"code"];
-        if ([code isEqualToString:@"REVOKED"] || [code isEqualToString:@"EXPIRED"] ||
-            [code isEqualToString:@"DEVICE_MISMATCH"]) {
-            [d removeObjectForKey:kPrefKey];
-            [d synchronize];
+        // 时间回拨检测
+        long long lastTs = [d integerForKey:kPrefLastTs];
+        long long nowTs = (long long)[[NSDate date] timeIntervalSince1970];
+        if (lastTs > 0 && nowTs + 60 < lastTs) {
+            done(NO, @"检测到系统时间被回拨，请校准时间");
+            return;
         }
-        dispatch_async(dispatch_get_main_queue(), ^{ done(ok, why); });
+
+        NSString *dev = deviceId();
+        NSString *nonce = randomNonce();
+        NSDictionary *r = postSync(@"/activate", @{ @"key": key,
+                                                    @"device": dev,
+                                                    @"nonce": nonce,
+                                                    @"ts": @(nowTs),
+                                                    @"ver": @"4.0" });
+        BOOL ok = NO; NSString *why = nil;
+        if (!r) {
+            why = @"无法连接验证服务器";
+            if (!kStrict) {
+                NSData *tk = [d objectForKey:kPrefTicket];
+                if (tk) { ok = YES; why = nil; }   // 宽松模式：有旧票据就放行
+            }
+        } else if (!verifyResponse(r, dev)) {
+            // 签名不对：可能是假服务器 / 被篡改
+            ok = NO; why = @"响应校验失败（疑似伪造服务器）";
+        } else if (![r[@"ok"] boolValue]) {
+            NSString *code = r[@"code"];
+            why = humanize(code, r[@"err"]);
+            if ([code isEqualToString:@"REVOKED"] || [code isEqualToString:@"EXPIRED"] ||
+                [code isEqualToString:@"DEVICE_MISMATCH"] || [code isEqualToString:@"NOT_FOUND"]) {
+                [d removeObjectForKey:kPrefKey];
+                [d removeObjectForKey:kPrefTicket];
+            }
+        } else {
+            ok = YES;
+            // 存票据（含签名，改了就失效）+ 记录服务器时间
+            [d setObject:r forKey:kPrefTicket];
+            [d setInteger:[r[@"ts"] longLongValue] forKey:kPrefLastTs];
+        }
+        [d synchronize];
+        done(ok, why);
     });
 }
 
-// 弹出拦截框（只允许「激活」或「退出」）
+// ---------------- UI ----------------
+static UIViewController *topVC(void) {
+    UIWindow *w = UIApplication.sharedApplication.keyWindow;
+    if (!w) { for (UIWindow *x in UIApplication.sharedApplication.windows) { w = x; break; } }
+    UIViewController *vc = w.rootViewController;
+    while (vc.presentedViewController) vc = vc.presentedViewController;
+    return vc;
+}
+
 static void showGate(NSString *why) {
-    if (gAlert || gBusy) return;
+    if (gVerified || gAlert) return;
     UIViewController *vc = topVC();
     if (!vc) {
-        // 界面还没起来，稍后重试
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{ showGate(why); });
         return;
     }
-
     UIAlertController *a = [UIAlertController alertControllerWithTitle:@"卡密验证"
-                                                              message:why ?: @"请输入卡密"
+                                                              message:why ?: @"请输入卡密后激活"
                                                        preferredStyle:UIAlertControllerStyleAlert];
     [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
         tf.placeholder = @"DFUA-XXXX-XXXX-XXXX-XXXX";
@@ -117,71 +225,82 @@ static void showGate(NSString *why) {
             [[NSUserDefaults standardUserDefaults] setObject:k forKey:kPrefKey];
             [[NSUserDefaults standardUserDefaults] synchronize];
         }
-        gBusy = YES;
+        gAlert = nil;
         verifyAsync(^(BOOL ok, NSString *w) {
-            gBusy = NO;
-            if (ok) {
-                NSLog(@"[DFGate] 验证通过");
-                gAlert = nil;
-                return;
-            }
-            NSLog(@"[DFGate] 验证失败: %@", w);
-            gAlert = nil;
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{ showGate(w); });
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (ok) { NSLog(@"[DFGate] 通过"); gVerified = YES; return; }
+                NSLog(@"[DFGate] 失败: %@", w);
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{ showGate(w); });
+            });
         });
     }]];
     [a addAction:[UIAlertAction actionWithTitle:@"退出" style:UIAlertActionStyleDestructive
-                                       handler:^(UIAlertAction *act) {
-        NSLog(@"[DFGate] 用户退出");
-        exit(0);
-    }]];
-    // 禁止点击遮罩关闭
-    a.modalInPopover = YES;
-
+                                       handler:^(UIAlertAction *act) { exit(0); }]];
     gAlert = a;
     [vc presentViewController:a animated:YES completion:nil];
-    NSLog(@"[DFGate] 已弹出卡密拦截框: %@", why);
+    NSLog(@"[DFGate] 拦截框: %@", why);
 }
 
-// ============ 挂钩：启动后异步校验，不阻塞 ============
-static IMP gOrigLaunch = NULL;
+// ---------------- 入口拦截 ----------------
+static IMP gOrigButton = NULL, gOrigInit = NULL, gOrigStart = NULL, gOrigKernel = NULL;
 
+static void gate_button(id self, SEL _cmd, id sender) {
+    if (!gVerified) { NSLog(@"[DFGate] 拦 mainButtonTapped:"); showGate(@"请先激活卡密"); return; }
+    if (gOrigButton) ((void (*)(id, SEL, id))gOrigButton)(self, _cmd, sender);
+}
+static void gate_init(id self, SEL _cmd) {
+    if (!gVerified) { NSLog(@"[DFGate] 拦 doInitKernel"); showGate(@"请先激活卡密"); return; }
+    if (gOrigInit) ((void (*)(id, SEL))gOrigInit)(self, _cmd);
+}
+static void gate_start(id self, SEL _cmd) {
+    if (!gVerified) { NSLog(@"[DFGate] 拦 doStartHUD"); showGate(@"请先激活卡密"); return; }
+    if (gOrigStart) ((void (*)(id, SEL))gOrigStart)(self, _cmd);
+}
+static void gate_kernel(id self, SEL _cmd, id block) {
+    if (!gVerified) { NSLog(@"[DFGate] 拦 initKernelWithCompletion:"); showGate(@"请先激活卡密"); return; }
+    if (gOrigKernel) ((void (*)(id, SEL, id))gOrigKernel)(self, _cmd, block);
+}
+
+static IMP gOrigLaunch = NULL;
 static BOOL my_didFinishLaunching(id self, SEL _cmd, UIApplication *app, NSDictionary *opts) {
     BOOL ret = YES;
-    if (gOrigLaunch) {
-        ret = ((BOOL (*)(id, SEL, UIApplication *, NSDictionary *))gOrigLaunch)(self, _cmd, app, opts);
-    }
-    // 界面起来后再校验
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+    if (gOrigLaunch) ret = ((BOOL (*)(id, SEL, UIApplication *, NSDictionary *))gOrigLaunch)(self, _cmd, app, opts);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         verifyAsync(^(BOOL ok, NSString *why) {
-            if (ok) {
-                NSLog(@"[DFGate] 缓存卡密有效，放行");
-            } else {
-                showGate(why);
-            }
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (ok) { NSLog(@"[DFGate] 缓存票据有效"); gVerified = YES; }
+                else showGate(why);
+            });
         });
     });
     return ret;
 }
 
+static void hookMethod(Class cls, SEL sel, IMP newImp, IMP *origOut) {
+    if (!cls) return;
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) { NSLog(@"[DFGate] 缺方法 %@", NSStringFromSelector(sel)); return; }
+    if (origOut) *origOut = method_getImplementation(m);
+    method_setImplementation(m, newImp);
+}
+
 __attribute__((constructor))
 static void dfgate_init(void) {
     @autoreleasepool {
-        Class cls = NSClassFromString(kAppDelegateClass);
-        if (!cls) {
-            NSLog(@"[DFGate] 未找到 AppDelegate 类，门禁未生效");
-            return;
+        Class vc = NSClassFromString(kGateVCClass);
+        if (vc) {
+            hookMethod(vc, sel_registerName("mainButtonTapped:"), (IMP)gate_button, &gOrigButton);
+            hookMethod(vc, sel_registerName("doInitKernel"),      (IMP)gate_init,   &gOrigInit);
+            hookMethod(vc, sel_registerName("doStartHUD"),        (IMP)gate_start,  &gOrigStart);
         }
-        SEL sel = sel_registerName("application:didFinishLaunchingWithOptions:");
-        Method m = class_getInstanceMethod(cls, sel);
-        if (!m) {
-            NSLog(@"[DFGate] 未找到启动方法，门禁未生效");
-            return;
+        Class del = NSClassFromString(kAppDelegateClass);
+        if (del) {
+            hookMethod(del, sel_registerName("initKernelWithCompletion:"), (IMP)gate_kernel, &gOrigKernel);
+            hookMethod(del, sel_registerName("application:didFinishLaunchingWithOptions:"),
+                       (IMP)my_didFinishLaunching, &gOrigLaunch);
         }
-        gOrigLaunch = method_getImplementation(m);
-        method_setImplementation(m, (IMP)my_didFinishLaunching);
-        NSLog(@"[DFGate] 门禁已挂钩");
+        NSLog(@"[DFGate] v4 已加载（签名校验 + 防重放 + 入口拦截）");
     }
 }
