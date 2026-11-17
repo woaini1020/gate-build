@@ -336,24 +336,38 @@ static NSString *formatExpiry(long long exp) {
     if (exp <= 0) return @"永久";
     NSDate *d = [NSDate dateWithTimeIntervalSince1970:(NSTimeInterval)exp];
     NSDateFormatter *f = [[NSDateFormatter alloc] init];
-    f.dateFormat = @"yyyy-MM-dd";
+    f.dateFormat = @"yyyy-MM-dd HH:mm";
     return [f stringFromDate:d];
 }
 
 // 必须在主线程调用
 static void updateBadgeWith(NSDictionary *r) {
-    long long left = [r[@"left_days"] longLongValue];
     long long exp = [r[@"expires"] longLongValue];
+    long long left;                       // 剩余秒数，-1 表示永久
+    if (exp <= 0) {
+        left = -1;
+    } else if (r[@"left_secs"] != nil) {
+        left = [r[@"left_secs"] longLongValue];
+    } else {
+        left = exp - (long long)[[NSDate date] timeIntervalSince1970];
+        if (left < 0) left = 0;
+    }
     NSString *line1;
     if (left < 0) {
         line1 = @"授权 永久";
-    } else if (left <= 0) {
-        line1 = @"今日到期";
+    } else if (left >= 86400) {
+        line1 = [NSString stringWithFormat:@"剩余 %lld 天 %lld 小时",
+                 left / 86400, (left % 86400) / 3600];
+    } else if (left >= 3600) {
+        line1 = [NSString stringWithFormat:@"剩余 %lld 小时 %lld 分",
+                 left / 3600, (left % 3600) / 60];
+    } else if (left > 0) {
+        line1 = [NSString stringWithFormat:@"剩余 %lld 分", left / 60 + 1];
     } else {
-        long long days = left;   // 服务器按天取整
-        line1 = [NSString stringWithFormat:@"剩余 %lld 天", days];
+        line1 = @"已到期";
     }
-    NSString *line2 = [NSString stringWithFormat:@"%@ 到期", formatExpiry(exp)];
+    NSString *line2 = (exp <= 0) ? @"永久有效"
+                                 : [NSString stringWithFormat:@"%@ 到期", formatExpiry(exp)];
     NSString *text = [NSString stringWithFormat:@"%@\n%@", line1, line2];
 
     UIWindow *win = UIApplication.sharedApplication.keyWindow;
