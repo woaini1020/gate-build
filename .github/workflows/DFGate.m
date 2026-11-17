@@ -1,5 +1,5 @@
 //
-// DFGate.m — 卡密门禁 dylib（v4：响应验签 + 防重放 + 地址混淆 + 入口拦截）
+// DFGate.m — 卡密门禁 dylib（v4.1：修复封卡后重复弹框导致闪退）
 //
 // 相对 v3 加固点：
 //   1. 服务器地址、签名密钥都做异或混淆，strings 看不到明文
@@ -200,6 +200,50 @@ static UIViewController *topVC(void) {
     return vc;
 }
 
+static void showGate(NSString *why);
+static void showTerminal(NSString *why);
+
+// 安全呈现：避免"正在呈现/正在消失"时重复 present 导致崩溃
+static BOOL presentSafe(UIViewController *vc, UIAlertController *a, int attempt) {
+    if (!vc || !vc.view.window) return NO;
+    @try {
+        if (vc.presentedViewController) {
+            if (attempt < 3) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{ presentSafe(vc, a, attempt + 1); });
+            }
+            return NO;
+        }
+        [vc presentViewController:a animated:YES completion:nil];
+        return YES;
+    } @catch (NSException *e) {
+        NSLog(@"[DFGate] present 异常（已吞掉）: %@", e);
+        return NO;
+    }
+}
+
+// 终局提示：卡被停用/过期/绑了别的设备 → 只给「退出」，不循环弹框
+static void showTerminal(NSString *why) {
+    if (gAlert) return;
+    UIViewController *vc = topVC();
+    if (!vc) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ showTerminal(why); });
+        return;
+    }
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"卡密已失效"
+                                                              message:why ?: @"请联系卖家"
+                                                       preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"退出" style:UIAlertActionStyleDestructive
+                                       handler:^(UIAlertAction *act) { exit(0); }]];
+    gAlert = a;
+    if (!presentSafe(vc, a, 0)) {
+        // 呈现不了就直接退出，避免留下半开状态
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ exit(0); });
+    }
+}
+
 static void showGate(NSString *why) {
     if (gVerified || gAlert) return;
     UIViewController *vc = topVC();
@@ -228,18 +272,29 @@ static void showGate(NSString *why) {
         gAlert = nil;
         verifyAsync(^(BOOL ok, NSString *w) {
             dispatch_async(dispatch_get_main_queue(), ^{
-                if (ok) { NSLog(@"[DFGate] 通过"); gVerified = YES; return; }
+                if (ok) { NSLog(@"[DFGate] 通过"); gVerified = YES; startHeartbeat(); return; }
                 NSLog(@"[DFGate] 失败: %@", w);
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{ showGate(w); });
+                // 硬失败 → 终局提示；软失败 → 重新输入
+                if ([w rangeOfString:@"停用"].location != NSNotFound ||
+                    [w rangeOfString:@"过期"].location != NSNotFound ||
+                    [w rangeOfString:@"其他设备"].location != NSNotFound ||
+                    [w rangeOfString:@"不存在"].location != NSNotFound) {
+                    showTerminal(w);
+                } else {
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), ^{ showGate(w); });
+                }
             });
         });
     }]];
     [a addAction:[UIAlertAction actionWithTitle:@"退出" style:UIAlertActionStyleDestructive
                                        handler:^(UIAlertAction *act) { exit(0); }]];
     gAlert = a;
-    [vc presentViewController:a animated:YES completion:nil];
-    NSLog(@"[DFGate] 拦截框: %@", why);
+    if (!presentSafe(vc, a, 0)) {
+        gAlert = nil;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ showGate(why); });
+    }
 }
 
 // ---------------- 入口拦截 ----------------
@@ -263,6 +318,60 @@ static void gate_kernel(id self, SEL _cmd, id block) {
 }
 
 static IMP gOrigLaunch = NULL;
+
+// ============ 心跳：后台封卡可即时踢下线 ============
+static const double   kHeartbeatSec  = 20.0;   // 心跳间隔（秒）
+static const BOOL     kKillImmediately = NO;   // YES=发现封卡立刻退出(无提示)；NO=先弹提示再退
+static NSTimer *gTimer = nil;
+static BOOL gKilling = NO;
+
+static BOOL isHardFail(NSString *why) {
+    return ([why rangeOfString:@"停用"].location != NSNotFound ||
+            [why rangeOfString:@"过期"].location != NSNotFound ||
+            [why rangeOfString:@"其他设备"].location != NSNotFound ||
+            [why rangeOfString:@"不存在"].location != NSNotFound);
+}
+
+static void heartbeatOnce(void) {
+    if (gKilling) return;
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    NSString *key = [d stringForKey:kPrefKey];
+    if (key.length == 0) return;
+    NSString *dev = deviceId();
+    long long ts = (long long)[[NSDate date] timeIntervalSince1970];
+    NSDictionary *r = postSync(@"/heartbeat", @{ @"key": key, @"device": dev,
+                                                 @"nonce": randomNonce(),
+                                                 @"ts": @(ts), @"ver": @"4.2" });
+    if (!r) return;                       // 网络问题不误杀
+    if (!verifyResponse(r, dev)) return;  // 签名不对不误杀
+    if ([r[@"ok"] boolValue]) return;
+
+    NSString *code = r[@"code"];
+    NSString *why = humanize(code, r[@"err"]);
+    if (!isHardFail(why)) return;
+    NSLog(@"[DFGate] 心跳发现卡密失效: %@", why);
+    gKilling = YES;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (kKillImmediately) {
+            exit(0);
+        } else {
+            showTerminal(why);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ exit(0); });
+        }
+    });
+}
+
+static void startHeartbeat(void) {
+    if (gTimer) return;
+    gTimer = [NSTimer scheduledTimerWithTimeInterval:kHeartbeatSec repeats:YES
+                                               block:^(NSTimer *t) { heartbeatOnce(); }];
+    NSLog(@"[DFGate] 心跳已启动，间隔 %.0f 秒", kHeartbeatSec);
+}
+
+static void onBecomeActive(void) {
+    if (gVerified) heartbeatOnce();
+}
 static BOOL my_didFinishLaunching(id self, SEL _cmd, UIApplication *app, NSDictionary *opts) {
     BOOL ret = YES;
     if (gOrigLaunch) ret = ((BOOL (*)(id, SEL, UIApplication *, NSDictionary *))gOrigLaunch)(self, _cmd, app, opts);
@@ -270,7 +379,7 @@ static BOOL my_didFinishLaunching(id self, SEL _cmd, UIApplication *app, NSDicti
                    dispatch_get_main_queue(), ^{
         verifyAsync(^(BOOL ok, NSString *why) {
             dispatch_async(dispatch_get_main_queue(), ^{
-                if (ok) { NSLog(@"[DFGate] 缓存票据有效"); gVerified = YES; }
+                if (ok) { NSLog(@"[DFGate] 缓存票据有效"); gVerified = YES; startHeartbeat(); }
                 else showGate(why);
             });
         });
@@ -301,6 +410,10 @@ static void dfgate_init(void) {
             hookMethod(del, sel_registerName("application:didFinishLaunchingWithOptions:"),
                        (IMP)my_didFinishLaunching, &gOrigLaunch);
         }
-        NSLog(@"[DFGate] v4 已加载（签名校验 + 防重放 + 入口拦截）");
+        [[NSNotificationCenter defaultCenter]
+            addObserverForName:UIApplicationDidBecomeActiveNotification
+                        object:nil queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification *n) { onBecomeActive(); }];
+        NSLog(@"[DFGate] v4.2 已加载（验签 + 防重放 + 入口拦截 + 心跳踢下线）");
     }
 }
