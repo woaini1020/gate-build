@@ -42,6 +42,17 @@ static const  double    kTimeout  = 8.0;
 static NSString *const kAppDelegateClass = @"k52msrp07bj14wt63uqhd9nlf8cxyaz5";
 static NSString *const kGateVCClass      = @"b2lrzw37gk19vs26jmcp8dqh4nuxey6";
 
+// ---------- 前向声明（C99 要求先声明后使用）----------
+static NSDictionary *gLastResp;
+static void updateBadgeWith(NSDictionary *r);
+static void badgeInvalid(NSString *why);
+static void startHeartbeat(void);
+static void heartbeatOnce(void);
+static void showGate(NSString *why);
+static void showTerminal(NSString *why);
+static void verifyAsync(void (^done)(BOOL ok, NSString *why));
+// ---------------------------------------------------
+
 static volatile BOOL gVerified = NO;
 static UIAlertController *gAlert = nil;
 
@@ -320,7 +331,6 @@ static void gate_kernel(id self, SEL _cmd, id block) {
 
 // ============ 到期徽标（常驻右上角）============
 static UILabel *gBadge = nil;
-static NSDictionary *gLastResp = nil;
 
 static NSString *formatExpiry(long long exp) {
     if (exp <= 0) return @"永久";
