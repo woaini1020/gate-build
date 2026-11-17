@@ -182,6 +182,7 @@ static void verifyAsync(void (^done)(BOOL ok, NSString *why)) {
             }
         } else {
             ok = YES;
+            gLastResp = r;
             // 存票据（含签名，改了就失效）+ 记录服务器时间
             [d setObject:r forKey:kPrefTicket];
             [d setInteger:[r[@"ts"] longLongValue] forKey:kPrefLastTs];
@@ -272,7 +273,7 @@ static void showGate(NSString *why) {
         gAlert = nil;
         verifyAsync(^(BOOL ok, NSString *w) {
             dispatch_async(dispatch_get_main_queue(), ^{
-                if (ok) { NSLog(@"[DFGate] 通过"); gVerified = YES; startHeartbeat(); return; }
+                if (ok) { NSLog(@"[DFGate] 通过"); gVerified = YES; updateBadgeWith(gLastResp); startHeartbeat(); return; }
                 NSLog(@"[DFGate] 失败: %@", w);
                 // 硬失败 → 终局提示；软失败 → 重新输入
                 if ([w rangeOfString:@"停用"].location != NSNotFound ||
@@ -317,6 +318,72 @@ static void gate_kernel(id self, SEL _cmd, id block) {
     if (gOrigKernel) ((void (*)(id, SEL, id))gOrigKernel)(self, _cmd, block);
 }
 
+// ============ 到期徽标（常驻右上角）============
+static UILabel *gBadge = nil;
+static NSDictionary *gLastResp = nil;
+
+static NSString *formatExpiry(long long exp) {
+    if (exp <= 0) return @"永久";
+    NSDate *d = [NSDate dateWithTimeIntervalSince1970:(NSTimeInterval)exp];
+    NSDateFormatter *f = [[NSDateFormatter alloc] init];
+    f.dateFormat = @"yyyy-MM-dd";
+    return [f stringFromDate:d];
+}
+
+// 必须在主线程调用
+static void updateBadgeWith(NSDictionary *r) {
+    long long left = [r[@"left_days"] longLongValue];
+    long long exp = [r[@"expires"] longLongValue];
+    NSString *line1;
+    if (left < 0) {
+        line1 = @"授权 永久";
+    } else if (left <= 0) {
+        line1 = @"今日到期";
+    } else {
+        long long days = left;   // 服务器按天取整
+        line1 = [NSString stringWithFormat:@"剩余 %lld 天", days];
+    }
+    NSString *line2 = [NSString stringWithFormat:@"%@ 到期", formatExpiry(exp)];
+    NSString *text = [NSString stringWithFormat:@"%@\n%@", line1, line2];
+
+    UIWindow *win = UIApplication.sharedApplication.keyWindow;
+    if (!win) {
+        for (UIWindow *w in UIApplication.sharedApplication.windows) {
+            if (w.isKeyWindow) { win = w; break; }
+            win = w;
+        }
+    }
+    if (!win) return;
+
+    if (!gBadge) {
+        gBadge = [[UILabel alloc] init];
+        gBadge.numberOfLines = 2;
+        gBadge.textAlignment = NSTextAlignmentCenter;
+        gBadge.font = [UIFont boldSystemFontOfSize:11];
+        gBadge.textColor = [UIColor colorWithWhite:1.0 alpha:0.95];
+        gBadge.backgroundColor = [UIColor colorWithRed:0 green:0 blue:0 alpha:0.55];
+        gBadge.layer.cornerRadius = 6;
+        gBadge.clipsToBounds = YES;
+        gBadge.userInteractionEnabled = NO;
+        gBadge.alpha = 0.9;
+        [win addSubview:gBadge];
+        NSLog(@"[DFGate] 徽标已创建");
+    }
+    [gBadge setText:text];
+    CGSize sz = [gBadge sizeThatFits:CGSizeMake(200, 60)];
+    CGFloat w = MAX(78, sz.width + 12), h = sz.height + 6;
+    CGFloat topInset = 8;
+    if (@available(iOS 11.0, *)) topInset = win.safeAreaInsets.top + 6;
+    gBadge.frame = CGRectMake(win.bounds.size.width - w - 8, topInset, w, h);
+    [win bringSubviewToFront:gBadge];
+}
+
+static void badgeInvalid(NSString *why) {
+    if (!gBadge) return;
+    gBadge.text = @"授权失效";
+    gBadge.backgroundColor = [UIColor colorWithRed:0.6 green:0 blue:0 alpha:0.75];
+}
+
 static IMP gOrigLaunch = NULL;
 
 // ============ 心跳：后台封卡可即时踢下线 ============
@@ -344,13 +411,14 @@ static void heartbeatOnce(void) {
                                                  @"ts": @(ts), @"ver": @"4.2" });
     if (!r) return;                       // 网络问题不误杀
     if (!verifyResponse(r, dev)) return;  // 签名不对不误杀
-    if ([r[@"ok"] boolValue]) return;
+    if ([r[@"ok"] boolValue]) { gLastResp = r; dispatch_async(dispatch_get_main_queue(), ^{ updateBadgeWith(r); }); return; }
 
     NSString *code = r[@"code"];
     NSString *why = humanize(code, r[@"err"]);
     if (!isHardFail(why)) return;
     NSLog(@"[DFGate] 心跳发现卡密失效: %@", why);
     gKilling = YES;
+    dispatch_async(dispatch_get_main_queue(), ^{ badgeInvalid(why); });
     dispatch_async(dispatch_get_main_queue(), ^{
         if (kKillImmediately) {
             exit(0);
@@ -379,7 +447,7 @@ static BOOL my_didFinishLaunching(id self, SEL _cmd, UIApplication *app, NSDicti
                    dispatch_get_main_queue(), ^{
         verifyAsync(^(BOOL ok, NSString *why) {
             dispatch_async(dispatch_get_main_queue(), ^{
-                if (ok) { NSLog(@"[DFGate] 缓存票据有效"); gVerified = YES; startHeartbeat(); }
+                if (ok) { NSLog(@"[DFGate] 缓存票据有效"); gVerified = YES; updateBadgeWith(gLastResp); startHeartbeat(); }
                 else showGate(why);
             });
         });
