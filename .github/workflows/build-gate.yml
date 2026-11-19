@@ -85,14 +85,10 @@ jobs:
           mkdir -p work && cd work
           unzip -q -o ../gated.tipa
           APP=$(ls -d Payload/*.app | head -1)
-          EXE=""
-          for f in "$APP"/*; do
-            [ -f "$f" ] || continue
-            if [ "$(head -c 4 "$f" | od -An -tx1 | tr -d ' \n')" = "cffaedfe" ]; then
-              EXE=$(basename "$f"); break
-            fi
-          done
-          [ -n "$EXE" ] || { echo "!! 找不到 Mach-O 主程序"; exit 1; }
+          # 从 Info.plist 精确取主程序名（避免命中 DFGate.dylib 等 Mach-O 文件）
+          EXE=$(python3 -c "import plistlib,sys;print(plistlib.load(open(sys.argv[1],'rb'))['CFBundleExecutable'])" "$APP/Info.plist")
+          [ -n "$EXE" ] || { echo "!! 读不到 CFBundleExecutable"; exit 1; }
+          [ -f "$APP/$EXE" ] || { echo "!! 主程序不存在: $APP/$EXE"; exit 1; }
           echo "APP=$APP  EXE=$EXE"
           ldid -S../app_entitlements.plist "$APP/$EXE"
           echo "--- 已写入的 entitlements ---"
@@ -109,11 +105,14 @@ jobs:
           z = zipfile.ZipFile("gated.tipa")
           names = z.namelist()
           assert any(n.endswith("DFGate.dylib") for n in names), "dylib not packed"
-          cands = [n for n in names if n.startswith("Payload/") and n.count("/") == 2
-                   and not n.endswith("/") and n.rsplit("/", 1)[-1] != "PkgInfo"]
-          exe = [n for n in cands if z.read(n)[:4] == b"\xcf\xfa\xed\xfe"] or cands
-          print("候选:", cands)
-          assert exe, "exe not found"
+          import plistlib, io
+          appdir = [n for n in names if n.endswith(".app/Info.plist")][0].rsplit("/", 1)[0]
+          info = plistlib.loads(z.read(appdir + "/Info.plist"))
+          exe_name = info["CFBundleExecutable"]
+          exe = [appdir + "/" + exe_name]
+          print("appdir:", appdir)
+          print("exe   :", exe[0])
+          assert exe[0] in names, "主程序不在包里"
           b = z.read(exe[0])
           n = struct.unpack("<I", b[16:20])[0]
           p, found = 32, None
