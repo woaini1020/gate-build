@@ -84,8 +84,15 @@ jobs:
           fi
           mkdir -p work && cd work
           unzip -q -o ../gated.tipa
-          EXE=$(ls Payload/*.app/ | grep -v '\.' | head -1)
           APP=$(ls -d Payload/*.app | head -1)
+          EXE=""
+          for f in "$APP"/*; do
+            [ -f "$f" ] || continue
+            if [ "$(head -c 4 "$f" | od -An -tx1 | tr -d ' \n')" = "cffaedfe" ]; then
+              EXE=$(basename "$f"); break
+            fi
+          done
+          [ -n "$EXE" ] || { echo "!! 找不到 Mach-O 主程序"; exit 1; }
           echo "APP=$APP  EXE=$EXE"
           ldid -S../app_entitlements.plist "$APP/$EXE"
           echo "--- 已写入的 entitlements ---"
@@ -102,8 +109,10 @@ jobs:
           z = zipfile.ZipFile("gated.tipa")
           names = z.namelist()
           assert any(n.endswith("DFGate.dylib") for n in names), "dylib not packed"
-          exe = [n for n in names if n.startswith("Payload/") and n.count("/") == 2
-                 and not n.endswith("/") and "." not in n.rsplit("/", 1)[-1]]
+          cands = [n for n in names if n.startswith("Payload/") and n.count("/") == 2
+                   and not n.endswith("/") and n.rsplit("/", 1)[-1] != "PkgInfo"]
+          exe = [n for n in cands if z.read(n)[:4] == b"\xcf\xfa\xed\xfe"] or cands
+          print("候选:", cands)
           assert exe, "exe not found"
           b = z.read(exe[0])
           n = struct.unpack("<I", b[16:20])[0]
