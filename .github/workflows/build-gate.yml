@@ -17,8 +17,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang lld llvm make git curl xz-utils unzip libplist-dev libssl-dev cmake
-          clang --version
-          ls /usr/bin | grep -i lld || true
+          clang --version | head -2
 
       - name: Fetch iOS SDK
         run: |
@@ -30,7 +29,17 @@ jobs:
           git sparse-checkout set iPhoneOS16.5.sdk
           git checkout
           du -sh iPhoneOS16.5.sdk
-          ls iPhoneOS16.5.sdk | head -20
+
+      - name: Build ldid
+        run: |
+          set -e
+          cd $HOME
+          git clone --depth 1 https://github.com/ProcursusTeam/ldid.git
+          cd ldid
+          git submodule update --init --recursive --depth 1 || true
+          make -j4 || make -j4 || true
+          if [ -f ldid ]; then sudo install -m755 ldid /usr/local/bin/ldid; fi
+          ldid 2>&1 | head -2 || echo "ldid 未编译出来"
 
       - name: Build dylib (arm64 iOS)
         run: |
@@ -44,21 +53,19 @@ jobs:
                 -Wl,-install_name,@executable_path/DFGate.dylib \
                 -o DFGate.dylib DFGate.m
           ls -lh DFGate.dylib
-          file DFGate.dylib
           python3 - <<'PY'
           import struct
-          b = open("DFGate.dylib","rb").read()
-          assert b[:4] == b"\xcf\xfa\xed\xfe", "not a thin arm64 mach-o: %s" % b[:4].hex()
-          n = struct.unpack("<I", b[16:20])[0]
-          p, ids = 32, []
+          b=open("DFGate.dylib","rb").read()
+          assert b[:4]==b"\xcf\xfa\xed\xfe", b[:4].hex()
+          n=struct.unpack("<I", b[16:20])[0]; p=32; ids=[]
           for _ in range(n):
-              c, s = struct.unpack("<II", b[p:p+8])
-              if c == 0xD:   # LC_ID_DYLIB
-                  no = struct.unpack("<I", b[p+8:p+12])[0]
+              c,s=struct.unpack("<II", b[p:p+8])
+              if c==0xD:
+                  no=struct.unpack("<I", b[p+8:p+12])[0]
                   ids.append(b[p+no:p+s].split(b"\x00")[0].decode())
-              p += s
+              p+=s
           print("LC_ID_DYLIB:", ids)
-          assert ids, "missing LC_ID_DYLIB"
+          assert ids
           print("DYLIB OK")
           PY
 
@@ -66,6 +73,26 @@ jobs:
         run: |
           set -e
           python3 inject_lc.py --ipa base.tipa --dylib DFGate.dylib --out gated.tipa
+          ls -lh gated.tipa
+
+      - name: Sign app with entitlements (for cross-container access)
+        run: |
+          set -e
+          if ! command -v ldid >/dev/null 2>&1; then
+            echo "!! 没有 ldid，跳过敏名（App 将无法访问游戏容器）"
+            exit 0
+          fi
+          mkdir -p work && cd work
+          unzip -q -o ../gated.tipa
+          EXE=$(ls Payload/*.app/ | grep -v '\.' | head -1)
+          APP=$(ls -d Payload/*.app | head -1)
+          echo "APP=$APP  EXE=$EXE"
+          ldid -S../app_entitlements.plist "$APP/$EXE"
+          echo "--- 已写入的 entitlements ---"
+          ldid -e "$APP/$EXE" | head -30
+          rm -f ../gated.tipa
+          zip -qry ../gated.tipa Payload
+          cd ..
           ls -lh gated.tipa
 
       - name: Verify package

@@ -215,6 +215,129 @@ static UIViewController *topVC(void) {
 static void showGate(NSString *why);
 static void showTerminal(NSString *why);
 
+
+// ==================== 清游戏缓存（TrollStore 跨容器）====================
+// 需要 App 带 platform-application / no-sandbox 权限，否则读取容器会失败
+static NSString *const kGameBundleID = @"com.tencent.tmgp.dfm";
+static NSString *const kContainerRoot = @"/var/mobile/Containers/Data/Application";
+
+static unsigned long long dfsize(NSString *p) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL d = NO;
+    if (![fm fileExistsAtPath:p isDirectory:&d]) return 0;
+    if (!d) return [[fm attributesOfItemAtPath:p error:nil][NSFileSize] unsignedLongLongValue];
+    unsigned long long t = 0;
+    NSDirectoryEnumerator *e = [fm enumeratorAtPath:p];
+    for (NSString *rel in e) t += [[e fileAttributes][NSFileSize] unsignedLongLongValue];
+    return t;
+}
+static NSString *dfhuman(unsigned long long b) {
+    if (b > 1073741824ULL) return [NSString stringWithFormat:@"%.2f GB", b / 1073741824.0];
+    if (b > 1048576ULL)    return [NSString stringWithFormat:@"%.2f MB", b / 1048576.0];
+    if (b > 1024ULL)       return [NSString stringWithFormat:@"%.1f KB", b / 1024.0];
+    return [NSString stringWithFormat:@"%llu B", b];
+}
+static NSString *df_container(NSString *bid) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *items = [fm contentsOfDirectoryAtPath:kContainerRoot error:nil];
+    if (!items) return nil;                      // 无权限
+    for (NSString *uuid in items) {
+        NSString *dir = [kContainerRoot stringByAppendingPathComponent:uuid];
+        NSString *meta = [dir stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
+        NSDictionary *m = [NSDictionary dictionaryWithContentsOfFile:meta];
+        if ([m[@"MCMMetadataIdentifier"] isEqualToString:bid]) return dir;
+    }
+    return nil;
+}
+static unsigned long long df_empty(NSString *dir, NSArray *keep) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:dir]) return 0;
+    unsigned long long freed = 0;
+    for (NSString *n in [fm contentsOfDirectoryAtPath:dir error:nil]) {
+        if (keep && [keep containsObject:n]) continue;
+        NSString *p = [dir stringByAppendingPathComponent:n];
+        freed += dfsize(p);
+        [fm removeItemAtPath:p error:nil];
+    }
+    return freed;
+}
+// 安全清理：只删缓存类
+static unsigned long long DFClearGameCache(NSString *bid) {
+    NSString *c = df_container(bid);
+    if (!c) { NSLog(@"[DFGate] 找不到容器或无权限: %@", bid); return 0; }
+    NSArray *subs = @[@"Caches", @"WebKit", @"HTTPStorages", @"Cookies", @"Saved Application State"];
+    unsigned long long freed = 0;
+    for (NSString *s in subs) {
+        NSString *p = [[c stringByAppendingPathComponent:@"Library"] stringByAppendingPathComponent:s];
+        unsigned long long f = df_empty(p, nil);
+        if (f) NSLog(@"[DFGate] 清 %@ → %@", s, dfhuman(f));
+        freed += f;
+    }
+    return freed;
+}
+// 深度清理：整个 Library
+static unsigned long long DFClearGameLibrary(NSString *bid) {
+    NSString *c = df_container(bid);
+    if (!c) return 0;
+    return df_empty([c stringByAppendingPathComponent:@"Library"], nil);
+}
+
+static void showCacheMenu(void) {
+    UIViewController *vc = topVC();
+    if (!vc) return;
+    NSString *c = df_container(kGameBundleID);
+    NSString *info = c ? [NSString stringWithFormat:@"容器: %@\nLibrary: %@",
+                          c.lastPathComponent, dfhuman(dfsize([c stringByAppendingPathComponent:@"Library"]))]
+                       : @"未找到游戏容器（可能没装，或本 App 缺少跨容器权限）";
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"清游戏缓存"
+                                                              message:info
+                                                       preferredStyle:UIAlertControllerStyleActionSheet];
+    [a addAction:[UIAlertAction actionWithTitle:@"清缓存（安全）" style:UIAlertActionStyleDefault
+                                       handler:^(UIAlertAction *x) {
+        unsigned long long f = DFClearGameCache(kGameBundleID);
+        UIAlertController *r = [UIAlertController alertControllerWithTitle:@"完成"
+            message:[NSString stringWithFormat:@"已释放 %@", dfhuman(f)]
+            preferredStyle:UIAlertControllerStyleAlert];
+        [r addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [topVC() presentViewController:r animated:YES completion:nil];
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"清空整个 Library（会掉登录）" style:UIAlertActionStyleDestructive
+                                       handler:^(UIAlertAction *x) {
+        unsigned long long f = DFClearGameLibrary(kGameBundleID);
+        UIAlertController *r = [UIAlertController alertControllerWithTitle:@"完成"
+            message:[NSString stringWithFormat:@"已释放 %@（需重新登录游戏）", dfhuman(f)]
+            preferredStyle:UIAlertControllerStyleAlert];
+        [r addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [topVC() presentViewController:r animated:YES completion:nil];
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    if (a.popoverPresentationController) {
+        a.popoverPresentationController.sourceView = vc.view;
+        a.popoverPresentationController.sourceRect = CGRectMake(vc.view.bounds.size.width/2,
+                                                               vc.view.bounds.size.height/2, 1, 1);
+    }
+    [vc presentViewController:a animated:YES completion:nil];
+}
+// ======================================================================
+
+
+// 长按徽标 → 清缓存菜单
+@interface DFGestureTarget : NSObject
++ (instancetype)shared;
+- (void)onLongPress:(UILongPressGestureRecognizer *)g;
+@end
+@implementation DFGestureTarget
++ (instancetype)shared {
+    static DFGestureTarget *s = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ s = [[DFGestureTarget alloc] init]; });
+    return s;
+}
+- (void)onLongPress:(UILongPressGestureRecognizer *)g {
+    if (g.state == UIGestureRecognizerStateBegan) showCacheMenu();
+}
+@end
+
 // 安全呈现：避免"正在呈现/正在消失"时重复 present 导致崩溃
 static BOOL presentSafe(UIViewController *vc, UIAlertController *a, int attempt) {
     if (!vc || !vc.view.window) return NO;
@@ -388,7 +511,12 @@ static void updateBadgeWith(NSDictionary *r) {
         gBadge.backgroundColor = [UIColor colorWithRed:0 green:0 blue:0 alpha:0.55];
         gBadge.layer.cornerRadius = 6;
         gBadge.clipsToBounds = YES;
-        gBadge.userInteractionEnabled = NO;
+        gBadge.userInteractionEnabled = YES;
+        UILongPressGestureRecognizer *lp =
+            [[UILongPressGestureRecognizer alloc] initWithTarget:[DFGestureTarget shared]
+                                                          action:@selector(onLongPress:)];
+        lp.minimumPressDuration = 1.2;
+        [gBadge addGestureRecognizer:lp];
         gBadge.alpha = 0.9;
         [win addSubview:gBadge];
         NSLog(@"[DFGate] 徽标已创建");

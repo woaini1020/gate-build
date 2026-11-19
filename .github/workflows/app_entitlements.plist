@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- 给主程序加跨容器权限：TrollStore 安装重签时会保留这些 -->
+	<key>platform-application</key>
+	<true/>
+	<key>com.apple.private.security.no-sandbox</key>
+	<true/>
+	<key>com.apple.private.security.storage.AppDataContainers</key>
+	<true/>
+	<key>com.apple.private.security.storage.MobileDocuments</key>
+	<true/>
+	<key>com.apple.security.exception.files.absolute-path.read-write</key>
+	<array>
+		<string>/var/mobile/Containers/Data/Application/</string>
+		<string>/var/mobile/Containers/Data/Application</string>
+	</array>
+	<!-- 不含 get-task-allow：避免 iOS 16+ 要求开启开发者模式 -->
+</dict>
+</plist>
